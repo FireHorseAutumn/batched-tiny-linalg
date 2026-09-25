@@ -1,0 +1,36 @@
+# Portfolio-safe .gitignore (this file ships with the public repo)
+
+# --- AI-assistant artifacts (never public) ---
+AGENTS.md
+CLAUDE.md
+claude_memory/
+.claude/
+.kimi-code/
+.kimi/
+.cursor/
+.cursorrules
+.aider*
+.continue/
+wire.jsonl
+*.ai-notes.md
+
+# --- Build ---
+build/
+*.o
+*.a
+*.so
+compile_commands.json
+.cache/
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# --- Benchmark outputs (regenerate; keep tables in README instead) ---
+bench_*_results.json
+
+# --- Downloaded datasets ---
+data/raw/
