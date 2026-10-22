@@ -1,0 +1,20 @@
+# --- Build ---
+build/
+*.o
+*.a
+*.so
+compile_commands.json
+.cache/
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# --- Benchmark outputs (regenerate; keep tables in README instead) ---
+bench_*_results.json
+
+# --- Downloaded datasets ---
+data/raw/
