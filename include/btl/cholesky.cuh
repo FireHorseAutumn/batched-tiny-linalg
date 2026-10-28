@@ -11,10 +11,15 @@
 //
 // Positive-definiteness reporting (LAPACK-style): info[b] == 0 on success;
 // info[b] == k (1-based) means pivot k-1 was not positive, i.e. matrix b is
-// not numerically SPD. On failure the kernel keeps running (with a safe
-// fallback pivot) so results stay finite, but L/x for that matrix are
-// garbage and must not be consumed. info is never silently skipped: every
-// factor kernel writes info[b] for every b in [0, batch).
+// not numerically SPD. On failure the kernel keeps running with a fallback
+// pivot of 1 at each non-positive pivot: the failed step itself stays
+// finite (no NaN from sqrt of a non-positive) and, in the warp kernels,
+// the tile's shuffles stay convergent; entries before the failed pivot
+// remain the valid factor. Entries at/after the failed pivot are garbage,
+// NOT guaranteed finite (a later pivot can land tiny-positive and the
+// trailing block can overflow), and must not be consumed. info is never
+// silently skipped: every factor kernel writes info[b] for every b in
+// [0, batch).
 //
 // Two execution strategies, same semantics:
 //   *_thread_per_matrix — one thread factors/solves one whole matrix.
@@ -43,7 +48,11 @@ struct tile_traits {
 // tile mask; all lanes of the tile run the full algorithm (clamped threads
 // with matrix id >= batch operate on a duplicate of the last matrix and are
 // masked off at store time) so every __shfl_sync / __ballot_sync stays
-// convergent.
+// convergent. Launch contract: blockDim.x % TILE == 0 (any multiple of 32
+// satisfies every TILE); otherwise a tile straddles a warp boundary and
+// tmask names lanes of a neighboring warp. Tile indexing is 32-bit int:
+// keep batch * TILE + blockDim.x < 2^31 (memory-bound long before that on
+// current hardware).
 template <int TILE>
 __device__ __forceinline__ unsigned tile_setup(int batch, int& m, int& lane,
                                                bool& store) {
@@ -51,7 +60,7 @@ __device__ __forceinline__ unsigned tile_setup(int batch, int& m, int& lane,
     m = tid / TILE;
     lane = tid % TILE;
     store = (m < batch);
-    if (!store) m = batch - 1;  // batch >= 1 guaranteed by host-side guard
+    if (!store) m = batch - 1;  // batch >= 1: caller kernels return on batch <= 0
     const unsigned laneid = threadIdx.x & 31u;
     if constexpr (TILE == 32) {
         return 0xffffffffu;
@@ -64,8 +73,10 @@ __device__ __forceinline__ unsigned tile_setup(int batch, int& m, int& lane,
 // In-register Cholesky of the matrix distributed one row per lane.
 // On entry row[j] holds A[min(lane,N-1)][j]. On exit row[j] holds
 // L[lane][j] for j <= lane (garbage above the diagonal on valid lanes).
-// Returns 0 on success, else k+1 where k is the first non-positive pivot
-// (uniform across the tile). sqrt/shuffle path is fully unrolled.
+// Returns 0 on success; on failure the lane owning the first non-positive
+// pivot k returns k+1 and all other lanes return 0 — the caller kernels
+// make the value tile-uniform via ballot + shfl before writing info.
+// sqrt/shuffle path is fully unrolled.
 template <typename T, int N, int TILE>
 __device__ __forceinline__ int factor_tile(unsigned tmask, int lane, T* row) {
     int fail = 0;
@@ -73,7 +84,7 @@ __device__ __forceinline__ int factor_tile(unsigned tmask, int lane, T* row) {
     for (int k = 0; k < N; ++k) {
         if (lane == k && !(row[k] > T(0))) {
             fail = k + 1;
-            row[k] = T(1);  // fallback pivot: keep results finite
+            row[k] = T(1);  // fallback: failed step finite, tile convergent
         }
         const T lkk = sqrt(__shfl_sync(tmask, row[k], k, TILE));
         const T lrk = row[k] / lkk;  // L[lane][k] on lanes >= k
@@ -154,7 +165,7 @@ __global__ void factor_thread_per_matrix(const T* __restrict__ A,
         T piv = m[k * N + k];
         if (!(piv > T(0))) {
             if (!fail) fail = k + 1;
-            piv = T(1);  // fallback pivot: keep results finite
+            piv = T(1);  // fallback: failed step finite, downstream garbage
         }
         const T lkk = sqrt(piv);
         m[k * N + k] = lkk;

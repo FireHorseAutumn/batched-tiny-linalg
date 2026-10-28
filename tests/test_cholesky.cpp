@@ -114,7 +114,7 @@ bool run_case(int batch) {
                                      : (N <= 16) ? 16 : 32;
     const int block = 256;
 
-    for (int variant = 0; variant < 3; ++variant) {
+    for (int variant = 0; variant < 4; ++variant) {
         const char* name;
         if (variant == 0) {
             name = "factor+solve thread/matrix";
@@ -123,6 +123,11 @@ bool run_case(int batch) {
             btl::solve_thread_per_matrix<T, N>
                 <<<(batch + block - 1) / block, block>>>(dL, dRhs, dX, batch);
         } else if (variant == 1) {
+            name = "factor_solve fused thread/matrix";
+            btl::factor_solve_thread_per_matrix<T, N>
+                <<<(batch + block - 1) / block, block>>>(dA, dRhs, dL, dX,
+                                                         batch, dInfo);
+        } else if (variant == 2) {
             name = "factor+solve warp/matrix";
             const int grid = (batch * TILE + block - 1) / block;
             btl::factor_warp_per_matrix<T, N><<<grid, block>>>(dA, dL, batch, dInfo);
@@ -149,7 +154,7 @@ bool run_case(int batch) {
                           (max_resid < Tols<T>::resid) &&
                           (max_solerr < Tols<T>::sol);
         ok &= pass;
-        printf("  n=%2d batch=%6d %-28s resid=%.3e solerr=%.3e info_bad=%d"
+        printf("  n=%2d batch=%6d %-32s resid=%.3e solerr=%.3e info_bad=%d"
                " eigen_fail=%d  %s\n",
                N, batch, name, max_resid, max_solerr, n_bad, n_eigen_fail,
                pass ? "PASS" : "FAIL");
@@ -163,48 +168,76 @@ bool run_case(int batch) {
 }
 
 // Plants one non-SPD matrix (negative pivot at 0) and one that goes
-// indefinite mid-factorization; both variants must flag exactly those.
+// indefinite at the last pivot; every factor-carrying variant must flag
+// exactly those two, with info = 1 and info = N (1-based first failed
+// pivot). Matrix 5's outputs must also stay finite: fallback damage is
+// confined to the trailing block at/after the failed pivot, so a failure
+// at pivot N-1 leaves the (valid) leading factor intact. Matrix 3 fails
+// at pivot 0 — its whole output is trailing garbage and is not checked
+// (a cascading failure is not guaranteed finite: a later pivot can land
+// tiny-positive and overflow; see the header contract).
 template <typename T, int N>
 bool run_nonspd() {
     const int batch = 8;
     std::vector<T> A, rhs;
     gen_spd_batch<T>(N, batch, A, rhs, 999 + N);
     A[(size_t)3 * N * N + 0] = T(-2);  // pivot 0 negative
-    // Matrix 5: SPD until the last pivot, then indefinite.
+    // Matrix 5: only the trailing diagonal entry is flipped, so the leading
+    // (N-1)x(N-1) principal block keeps its (positive) pivots and the first
+    // failing pivot is the last one: pivot N-1 = -save - N - sum_j L^2 < 0.
     {
         T* M = A.data() + (size_t)5 * N * N;
-        // Make the last diagonal entry exactly cancel: M[n-1][n-1] -=
-        // (sum needed) is fiddly; instead subtract a large multiple of I
-        // shifted to the last pivot via rank-1: M -= v v^T with v = e_0
-        // scaled to kill pivot 0 is matrix 3's trick. Here: set the trailing
-        // 2x2 block to be indefinite by flipping sign of the last diagonal
-        // and matching off-diagonal so the matrix stays symmetric.
         T save = M[(N - 1) * N + (N - 1)];
-        M[(N - 1) * N + (N - 1)] = -save - T(N);  // strongly negative
+        M[(N - 1) * N + (N - 1)] = -save - T(N);
     }
-    T *dA, *dL;
+    T *dA, *dL, *dRhs, *dX;
     int* dInfo;
     CK(cudaMalloc(&dA, A.size() * sizeof(T)));
     CK(cudaMalloc(&dL, A.size() * sizeof(T)));
+    CK(cudaMalloc(&dRhs, rhs.size() * sizeof(T)));
+    CK(cudaMalloc(&dX, rhs.size() * sizeof(T)));
     CK(cudaMalloc(&dInfo, batch * sizeof(int)));
     CK(cudaMemcpy(dA, A.data(), A.size() * sizeof(T), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dRhs, rhs.data(), rhs.size() * sizeof(T),
+                  cudaMemcpyHostToDevice));
     std::vector<int> info(batch);
+    std::vector<T> outL(A.size()), outx(rhs.size());
     bool ok = true;
 
     constexpr int TILE = (N <= 2) ? 2 : (N <= 4) ? 4 : (N <= 8) ? 8
                                      : (N <= 16) ? 16 : 32;
     const int block = 256;
-    for (int variant = 0; variant < 2; ++variant) {
-        if (variant == 0)
+    for (int variant = 0; variant < 4; ++variant) {
+        const char* name;
+        const bool fused = (variant == 1 || variant == 3);
+        if (variant == 0) {
+            name = "thread/matrix";
             btl::factor_thread_per_matrix<T, N>
                 <<<(batch + block - 1) / block, block>>>(dA, dL, batch, dInfo);
-        else
+        } else if (variant == 1) {
+            name = "fused thread/matrix";
+            btl::factor_solve_thread_per_matrix<T, N>
+                <<<(batch + block - 1) / block, block>>>(dA, dRhs, dL, dX,
+                                                         batch, dInfo);
+        } else if (variant == 2) {
+            name = "warp/matrix";
             btl::factor_warp_per_matrix<T, N>
                 <<<(batch * TILE + block - 1) / block, block>>>(dA, dL, batch,
                                                                 dInfo);
+        } else {
+            name = "fused warp/matrix";
+            btl::factor_solve_warp_per_matrix<T, N>
+                <<<(batch * TILE + block - 1) / block, block>>>(
+                    dA, dRhs, dL, dX, batch, dInfo);
+        }
         CK(cudaGetLastError());
         CK(cudaMemcpy(info.data(), dInfo, info.size() * sizeof(int),
                       cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(outL.data(), dL, outL.size() * sizeof(T),
+                      cudaMemcpyDeviceToHost));
+        if (fused)
+            CK(cudaMemcpy(outx.data(), dX, outx.size() * sizeof(T),
+                          cudaMemcpyDeviceToHost));
         bool pass = true;
         for (int b = 0; b < batch; ++b) {
             const bool expect_fail = (b == 3 || b == 5);
@@ -212,15 +245,22 @@ bool run_nonspd() {
             if (expect_fail != got_fail) pass = false;
         }
         if (info[3] != 1) pass = false;  // first pivot must be the one flagged
+        if (info[5] != N) pass = false;  // last pivot, 1-based
+        for (int i = 0; i < N * N; ++i)
+            if (!std::isfinite(outL[(size_t)5 * N * N + i])) pass = false;
+        if (fused)
+            for (int i = 0; i < N; ++i)
+                if (!std::isfinite(outx[(size_t)5 * N + i])) pass = false;
         ok &= pass;
-        printf("  n=%2d non-SPD flagging %-14s info=[%d %d %d %d %d %d %d %d]"
+        printf("  n=%2d non-SPD flagging %-19s info=[%d %d %d %d %d %d %d %d]"
                "  %s\n",
-               N, variant == 0 ? "thread/matrix" : "warp/matrix", info[0],
-               info[1], info[2], info[3], info[4], info[5], info[6], info[7],
-               pass ? "PASS" : "FAIL");
+               N, name, info[0], info[1], info[2], info[3], info[4], info[5],
+               info[6], info[7], pass ? "PASS" : "FAIL");
     }
     cudaFree(dA);
     cudaFree(dL);
+    cudaFree(dRhs);
+    cudaFree(dX);
     cudaFree(dInfo);
     return ok;
 }

@@ -120,8 +120,8 @@ btl reads A and writes L separately; cuSOLVER factors in place. Full data:
 btl-warp 0.145 ms; 0.660 ms vs 0.745 ms). Published per the kill criterion.
 Condition: fp64 + largest n in range + small/medium batch, where btl's
 launch-latency advantage is amortized away and cuSOLVER's tuned double
-pipelines dominate. btl wins the other 58/60 configs, by 1.2x–160x vs
-cuSOLVER and up to ~900x vs single-thread Eigen CPU.
+pipelines dominate. btl wins the other 58/60 configs, by 1.04x–160x vs
+cuSOLVER and up to ~826x vs single-thread Eigen CPU.
 
 ### Observations
 
